@@ -3014,8 +3014,10 @@ class FusedMoE(CustomOp):
             hidden_size = self.hidden_size
             buff_dtype = self.moe_config.in_dtype
              
-            pin_memory = is_pin_memory_available()
-            
+            ＃pin_memory = is_pin_memory_available()
+            pin_memory = True
+
+
             FusedMoE.output_gpu[current_device] = [
                 torch.zeros((batch_size, hidden_size), device=current_device, dtype=buff_dtype, requires_grad=False).contiguous()
                 for batch_size in FusedMoE.cuda_graphs
@@ -3710,3 +3712,84 @@ direct_register_custom_op(
 # Mark the FusedMoE weight_loader as supporting MoE-specific parameters
 # to avoid expensive runtime reflection in model loading code
 FusedMoE.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+def moe_cleanup_all_gpu_prefill(forward_context: ForwardContext = None) -> None:
+    """
+    Clean up all GPU prefill weights for all layers in the current batch.
+    This function should be called when a request is completed to release
+    GPU memory used by MoE prefill weights.
+    
+    Args:
+        forward_context: The forward context containing batch prefetch states (optional)
+    """
+    # Check if CUDA is available before attempting any GPU operations
+    #if not torch.cuda.is_available():
+    #    return
+    
+    # If forward_context is provided, clean up specific batch states
+    if forward_context is not None:
+        if not hasattr(forward_context, '_batch_prefetch_states'):
+            return
+        
+        if not hasattr(forward_context, '_prefetch_events'):
+            return
+        
+        if not forward_context.no_compile_layers:
+            return
+        
+        for batch_key, batch_state in list(forward_context._batch_prefetch_states.items()):
+            state = batch_state.get('state', {})
+            
+            for layer_idx in list(state.keys()):
+                for layer_name, layer_obj in forward_context.no_compile_layers.items():
+                    try:
+                        current_layer_idx = envs.extract_layer_index(layer_name)
+                        if current_layer_idx == layer_idx:
+                            if layer_obj and hasattr(layer_obj, 'should_use_gpu_prefill'):
+                                if layer_obj.should_use_gpu_prefill(torch.empty(1, device='cuda')):
+                                    moe_clean_gpu_prefill(layer_obj, torch.empty(1, device='cuda'))
+                                    
+                                    layer_id = id(layer_obj)
+                                    if layer_id in forward_context._prefetch_events:
+                                        del forward_context._prefetch_events[layer_id]
+                    except Exception:
+                        pass
+                
+                del state[layer_idx]
+            
+            del forward_context._batch_prefetch_states[batch_key]
+        
+        if hasattr(forward_context, '_prefetch_events'):
+            forward_context._prefetch_events.clear()
+    else:
+        # If no forward_context is provided, clean up all global MoE layers
+        # This is a fallback mechanism to ensure GPU memory is freed
+        import gc
+        
+        # Collect all MoE layers from garbage collector
+        for obj in gc.get_objects():
+            try:
+                # Check if object is a module and has the required attributes
+                # Use safe attribute access to avoid issues with special objects
+                if not hasattr(type(obj), '__module__'):
+                    continue
+                
+                # Check if it's likely a MoE layer by checking for specific attributes
+                # Use getattr with default to avoid hasattr issues with special objects
+                should_use_gpu_prefill = getattr(obj, 'should_use_gpu_prefill', None)
+                quant_method = getattr(obj, 'quant_method', None)
+                
+                if should_use_gpu_prefill is not None and quant_method is not None:
+                    if callable(should_use_gpu_prefill):
+                        try:
+                            if should_use_gpu_prefill(torch.empty(1, device='cuda')):
+                                moe_clean_gpu_prefill(obj, torch.empty(1, device='cuda'))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    
+    # Clear GPU cache to ensure memory is released
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
